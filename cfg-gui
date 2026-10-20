@@ -1,0 +1,720 @@
+#!/usr/bin/python3
+"""cfg-gui — графический поиск конфигов с открытием в nano / sudo nano.
+
+Список файлов берётся из консольного `cfg --list`. Если установлен vte4,
+nano запускается прямо внутри окна, иначе — в отдельном терминале
+(xdg-terminal-exec).
+"""
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import time
+import pwd
+import grp
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+
+try:
+    gi.require_version("Vte", "3.91")
+    from gi.repository import Vte  # noqa: E402
+except (ValueError, ImportError):
+    Vte = None
+
+APP_ID = "dev.nextagg.Cfg"
+HOME = os.path.expanduser("~")
+CFG = shutil.which("cfg") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cfg")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "cfg")
+RECENT_FILE = os.path.join(STATE_DIR, "recent.json")
+BANNER_FLAG = os.path.join(STATE_DIR, "no-vte-banner-dismissed")
+RECENT_MAX = 40
+PREVIEW_LIMIT = 512 * 1024
+
+EXT_GROUPS = {
+    "ini": "conf cfg config ini rc toml env properties nanorc list repo preset hook policy tmpl",
+    "data": "json jsonc json5 yaml yml xml kdl",
+    "code": "lua sh bash zsh fish vim py",
+    "style": "css scss qss theme",
+    "unit": "service timer socket target path mount network netdev link rules",
+    "desk": "desktop",
+}
+EXT_CLASS = {e: g for g, exts in EXT_GROUPS.items() for e in exts.split()}
+
+CSS = """
+.ext-badge {
+  font-family: monospace;
+  font-size: 0.72em;
+  font-weight: 800;
+  padding: 3px 0;
+  border-radius: 7px;
+  min-width: 42px;
+  background: rgba(127,127,127,.16);
+  color: rgba(127,127,127,1);
+}
+.ext-ini   { background: rgba(53,132,228,.16);  color: #3584e4; }
+.ext-data  { background: rgba(230,97,0,.16);    color: #e66100; }
+.ext-code  { background: rgba(46,194,126,.16);  color: #26a269; }
+.ext-style { background: rgba(145,65,172,.18);  color: #9141ac; }
+.ext-unit  { background: rgba(224,27,36,.14);   color: #e01b24; }
+.ext-desk  { background: rgba(229,165,10,.18);  color: #c88800; }
+
+.cfg-row { padding: 7px 4px; }
+.cfg-name { font-weight: 600; }
+.lock { color: #e5a50a; }
+
+.preview {
+  font-family: monospace;
+  font-size: 10.5pt;
+  background: transparent;
+}
+.meta-strip { padding: 8px 18px; }
+.meta-chip {
+  font-size: 0.82em;
+  padding: 3px 10px;
+  border-radius: 99px;
+  background: alpha(currentColor, .07);
+}
+.meta-chip.root { background: rgba(229,165,10,.18); color: #c88800; }
+.sidebar-tools { padding: 6px 10px 10px 10px; }
+"""
+
+
+# ── модель ──────────────────────────────────────────────────────────────────
+
+class ConfigFile(GObject.Object):
+    def __init__(self, path, writable):
+        super().__init__()
+        self.path = path
+        self.writable = writable
+        self.name = os.path.basename(path)
+        d = os.path.dirname(path)
+        self.dir = "~" + d[len(HOME):] if d == HOME or d.startswith(HOME + "/") else d
+        self.is_user = path.startswith(HOME + "/")
+        self.haystack = (self.dir + "/" + self.name).lower()
+        self.name_l = self.name.lower()
+        base = self.name.lstrip(".")
+        self.ext = base.rsplit(".", 1)[1].lower() if "." in base else ""
+
+
+def load_recent():
+    try:
+        with open(RECENT_FILE) as f:
+            return [p for p in json.load(f) if isinstance(p, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def save_recent(items):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(RECENT_FILE, "w") as f:
+            json.dump(items[:RECENT_MAX], f, indent=1)
+    except OSError:
+        pass
+
+
+def human_size(n):
+    for unit in ("Б", "КБ", "МБ"):
+        if n < 1024 or unit == "МБ":
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def owner_of(st):
+    try:
+        u = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        u = str(st.st_uid)
+    try:
+        g = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        g = str(st.st_gid)
+    return f"{u}:{g}"
+
+
+# ── окно ────────────────────────────────────────────────────────────────────
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Конфиги")
+        self.set_default_size(1280, 800)
+        self.set_icon_name("configurator-app")
+        self.set_size_request(360, 400)
+
+        self.store = Gio.ListStore(item_type=ConfigFile)
+        self.query_tokens = []
+        self.scope = "all"
+        self.recent = load_recent()
+        self.recent_rank = {p: i for i, p in enumerate(self.recent)}
+        self.current = None
+        self.editing = False
+
+        self.toasts = Adw.ToastOverlay()
+        self.split = Adw.NavigationSplitView(min_sidebar_width=340, max_sidebar_width=460,
+                                             sidebar_width_fraction=0.32)
+        self.toasts.set_child(self.split)
+        self.set_content(self.toasts)
+
+        self.split.set_sidebar(self._build_sidebar())
+        self.split.set_content(self._build_content())
+
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 820sp"))
+        bp.add_setter(self.split, "collapsed", True)
+        self.add_breakpoint(bp)
+
+        self._install_actions()
+        self.connect("notify::is-active", self._on_active_changed)
+        self.rescan()
+
+    # ── сайдбар ──
+    def _build_sidebar(self):
+        self.sidebar_title = Adw.WindowTitle(title="Конфиги", subtitle="поиск…")
+        header = Adw.HeaderBar(title_widget=self.sidebar_title)
+
+        rescan_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Пересканировать (Ctrl+R)",
+                                action_name="win.rescan")
+        header.pack_start(rescan_btn)
+
+        menu = Gio.Menu()
+        menu.append("Скопировать путь", "win.copy-path")
+        menu.append("Открыть папку", "win.open-folder")
+        menu.append("Пересканировать", "win.rescan")
+        menu.append("Горячие клавиши", "win.shortcuts")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, primary=True,
+                                       tooltip_text="Меню"))
+
+        self.search = Gtk.SearchEntry(placeholder_text="Найти конфиг… (hypr, ssh, pacman)", hexpand=True)
+        self.search.connect("search-changed", self._on_search)
+        self.search.connect("activate", lambda *_: self.open_current())
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_search_key)
+        self.search.add_controller(keys)
+        self.search.set_key_capture_widget(self)
+
+        self.scope_group = Adw.ToggleGroup(homogeneous=True)
+        for name, label in (("all", "Все"), ("user", "Мои"), ("system", "/etc"), ("recent", "Недавние")):
+            self.scope_group.add(Adw.Toggle(name=name, label=label))
+        self.scope_group.set_active_name("all")
+        self.scope_group.connect("notify::active-name", self._on_scope)
+
+        tools = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        tools.add_css_class("sidebar-tools")
+        tools.append(self.search)
+        tools.append(self.scope_group)
+
+        self.filter = Gtk.CustomFilter.new(self._filter_func)
+        self.sorter = Gtk.CustomSorter.new(self._sort_func)
+        filtered = Gtk.FilterListModel(model=self.store, filter=self.filter)
+        filtered.connect("notify::n-items", lambda *_: self._update_count())
+        self.filtered = filtered
+        sorted_model = Gtk.SortListModel(model=filtered, sorter=self.sorter)
+        self.selection = Gtk.SingleSelection(model=sorted_model, autoselect=True)
+        self.selection.connect("notify::selected-item", self._on_selected)
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._row_setup)
+        factory.connect("bind", self._row_bind)
+        self.listview = Gtk.ListView(model=self.selection, factory=factory)
+        self.listview.add_css_class("navigation-sidebar")
+        self.listview.connect("activate", lambda *_: self.open_current())
+
+        self.list_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
+        self.list_stack.add_named(Gtk.ScrolledWindow(child=self.listview, vexpand=True,
+                                                     hscrollbar_policy=Gtk.PolicyType.NEVER), "list")
+        self.list_stack.add_named(Adw.StatusPage(icon_name="edit-find-symbolic", title="Ничего не найдено",
+                                                 description="Попробуй другой запрос или вкладку «Все»"),
+                                  "empty")
+        spinner = Adw.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=40,
+                              height_request=40)
+        self.list_stack.add_named(spinner, "loading")
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.add_top_bar(tools)
+        view.set_content(self.list_stack)
+        return Adw.NavigationPage(title="Конфиги", child=view)
+
+    def _row_setup(self, _factory, item):
+        box = Gtk.Box(spacing=12)
+        box.add_css_class("cfg-row")
+        badge = Gtk.Label(valign=Gtk.Align.CENTER)
+        badge.add_css_class("ext-badge")
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True,
+                        valign=Gtk.Align.CENTER)
+        name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        name.add_css_class("cfg-name")
+        path = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.START)
+        path.add_css_class("caption")
+        path.add_css_class("dimmed")
+        texts.append(name)
+        texts.append(path)
+        lock = Gtk.Image(icon_name="changes-prevent-symbolic", tooltip_text="Только через sudo")
+        lock.add_css_class("lock")
+        box.append(badge)
+        box.append(texts)
+        box.append(lock)
+        item.set_child(box)
+
+    def _row_bind(self, _factory, item):
+        cfg = item.get_item()
+        box = item.get_child()
+        badge = box.get_first_child()
+        texts = badge.get_next_sibling()
+        lock = texts.get_next_sibling()
+        name = texts.get_first_child()
+        path = name.get_next_sibling()
+        for cls in list(badge.get_css_classes()):
+            if cls.startswith("ext-") and cls != "ext-badge":
+                badge.remove_css_class(cls)
+        badge.set_label((cfg.ext or "•")[:5])
+        if cfg.ext in EXT_CLASS:
+            badge.add_css_class("ext-" + EXT_CLASS[cfg.ext])
+        name.set_label(cfg.name)
+        path.set_label(cfg.dir)
+        lock.set_visible(not cfg.writable)
+
+    # ── фильтрация ──
+    def _filter_func(self, cfg, *_):
+        if self.scope == "user" and not cfg.is_user:
+            return False
+        if self.scope == "system" and cfg.is_user:
+            return False
+        if self.scope == "recent" and cfg.path not in self.recent_rank:
+            return False
+        return all(t in cfg.haystack for t in self.query_tokens)
+
+    def _score(self, cfg):
+        if self.scope == "recent" and not self.query_tokens:
+            return (self.recent_rank.get(cfg.path, 999),)
+        q = self.query_tokens[-1] if self.query_tokens else ""
+        if q:
+            if cfg.name_l == q or cfg.name_l.split(".")[0] == q:
+                s = 0
+            elif cfg.name_l.startswith(q):
+                s = 1
+            elif q in cfg.name_l:
+                s = 2
+            else:
+                s = 3
+        else:
+            s = 0
+        return (s, not cfg.is_user, cfg.haystack.count("/"), cfg.haystack)
+
+    def _sort_func(self, a, b, *_):
+        sa, sb = self._score(a), self._score(b)
+        return Gtk.Ordering.SMALLER if sa < sb else Gtk.Ordering.LARGER if sa > sb else Gtk.Ordering.EQUAL
+
+    def _refilter(self):
+        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+        self.sorter.changed(Gtk.SorterChange.DIFFERENT)
+        if self.selection.get_n_items():
+            self.selection.set_selected(0)
+            self.listview.scroll_to(0, Gtk.ListScrollFlags.NONE, None)
+
+    def _on_search(self, entry):
+        self.query_tokens = entry.get_text().lower().split()
+        self._refilter()
+
+    def _on_scope(self, group, _pspec):
+        self.scope = group.get_active_name()
+        self._refilter()
+
+    def _on_search_key(self, _ctl, keyval, _code, state):
+        n = self.selection.get_n_items()
+        if not n:
+            return False
+        pos = self.selection.get_selected()
+        step = {Gdk.KEY_Down: 1, Gdk.KEY_Up: -1, Gdk.KEY_Page_Down: 10, Gdk.KEY_Page_Up: -10}.get(keyval)
+        if step is None:
+            return False
+        pos = max(0, min(n - 1, (0 if pos == Gtk.INVALID_LIST_POSITION else pos) + step))
+        self.selection.set_selected(pos)
+        self.listview.scroll_to(pos, Gtk.ListScrollFlags.NONE, None)
+        return True
+
+    def _update_count(self):
+        if self.list_stack.get_visible_child_name() == "loading":
+            return
+        n = self.filtered.get_n_items()
+        total = self.store.get_n_items()
+        self.sidebar_title.set_subtitle(f"{n} из {total}" if n != total else f"{total} файлов")
+        self.list_stack.set_visible_child_name("list" if n else "empty")
+
+    # ── сканирование ──
+    def rescan(self, *_):
+        self.list_stack.set_visible_child_name("loading")
+        self.sidebar_title.set_subtitle("сканирую…")
+        try:
+            proc = Gio.Subprocess.new([CFG, "--list", "all"], Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as e:
+            self.toast(f"Не удалось запустить cfg: {e.message}")
+            return
+        proc.communicate_utf8_async(None, None, self._on_scanned)
+
+    def _on_scanned(self, proc, res):
+        try:
+            _ok, out, _err = proc.communicate_utf8_finish(res)
+        except GLib.Error as e:
+            self.toast(f"Ошибка сканирования: {e.message}")
+            out = ""
+        prev = self.current.path if self.current else None
+        items = []
+        for line in (out or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                items.append(ConfigFile(parts[0], parts[1] == "W"))
+        self.store.splice(0, self.store.get_n_items(), items)
+        self.list_stack.set_visible_child_name("list")
+        self._refilter()
+        self._update_count()
+        if prev:
+            self._select_path(prev)
+
+    def _select_path(self, path):
+        for i in range(self.selection.get_n_items()):
+            if self.selection.get_item(i).path == path:
+                self.selection.set_selected(i)
+                self.listview.scroll_to(i, Gtk.ListScrollFlags.NONE, None)
+                return
+
+    # ── правая часть ──
+    def _build_content(self):
+        self.content_title = Adw.WindowTitle(title="Конфиги", subtitle="")
+        header = Adw.HeaderBar(title_widget=self.content_title)
+
+        self.edit_btn = Adw.SplitButton(label="Редактировать", tooltip_text="Открыть в nano (Enter / Ctrl+E)",
+                                        action_name="win.edit")
+        self.edit_btn.add_css_class("suggested-action")
+        edit_menu = Gio.Menu()
+        edit_menu.append("Открыть в nano", "win.edit")
+        edit_menu.append("Открыть через sudo nano", "win.edit-sudo")
+        self.edit_btn.set_menu_model(edit_menu)
+        header.pack_end(self.edit_btn)
+
+        sudo_btn = Gtk.Button(tooltip_text="sudo nano (Ctrl+Shift+E)", action_name="win.edit-sudo")
+        sudo_btn.set_child(Adw.ButtonContent(icon_name="dialog-password-symbolic", label="sudo"))
+        header.pack_end(sudo_btn)
+
+        header.pack_start(Gtk.Button(icon_name="edit-copy-symbolic", tooltip_text="Скопировать путь (Ctrl+Shift+C)",
+                                     action_name="win.copy-path"))
+        header.pack_start(Gtk.Button(icon_name="folder-open-symbolic", tooltip_text="Открыть папку",
+                                     action_name="win.open-folder"))
+
+        # мета-информация
+        self.meta = Adw.WrapBox(child_spacing=6, line_spacing=6)
+        self.meta.add_css_class("meta-strip")
+
+        # превью
+        self.buffer = Gtk.TextBuffer()
+        tags = self.buffer.get_tag_table()
+        tags.add(Gtk.TextTag(name="comment", foreground="#8a8a8a", style=Pango.Style.ITALIC))
+        tags.add(Gtk.TextTag(name="key", foreground="#3584e4"))
+        tags.add(Gtk.TextTag(name="section", foreground="#9141ac", weight=Pango.Weight.BOLD))
+        tags.add(Gtk.TextTag(name="string", foreground="#26a269"))
+        self.textview = Gtk.TextView(buffer=self.buffer, editable=False, cursor_visible=False, monospace=True,
+                                     left_margin=20, right_margin=20, top_margin=12, bottom_margin=24,
+                                     wrap_mode=Gtk.WrapMode.NONE)
+        self.textview.add_css_class("preview")
+        preview_scroll = Gtk.ScrolledWindow(child=self.textview, vexpand=True)
+
+        preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        preview_box.append(self.meta)
+        preview_box.append(Gtk.Separator())
+        preview_box.append(preview_scroll)
+
+        self.locked_page = Adw.StatusPage(icon_name="changes-prevent-symbolic", title="Нет прав на чтение",
+                                          description="Файл доступен только root. Его можно открыть через sudo nano.")
+        open_sudo = Gtk.Button(label="Открыть через sudo nano", halign=Gtk.Align.CENTER,
+                               action_name="win.edit-sudo")
+        open_sudo.add_css_class("pill")
+        open_sudo.add_css_class("suggested-action")
+        self.locked_page.set_child(open_sudo)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
+        self.stack.add_named(Adw.StatusPage(icon_name="document-properties-symbolic", title="Выбери конфиг",
+                                            description="Начни печатать — поиск сработает сразу.\n"
+                                                        "Enter — открыть в nano, Ctrl+Shift+E — через sudo."),
+                             "none")
+        self.stack.add_named(preview_box, "preview")
+        self.stack.add_named(self.locked_page, "locked")
+        self.binary_page = Adw.StatusPage(icon_name="application-x-executable-symbolic",
+                                          title="Это не текстовый файл",
+                                          description="Превью недоступно, но открыть в nano всё равно можно.")
+        self.stack.add_named(self.binary_page, "binary")
+
+        self.terminal = None
+        self.banner = Adw.Banner(revealed=False)
+        if Vte is not None:
+            self.terminal = Vte.Terminal(vexpand=True, hexpand=True)
+            self.terminal.set_font(Pango.FontDescription.from_string("monospace 11"))
+            self.terminal.connect("child-exited", self._on_editor_exited)
+            term_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            hint = Gtk.Label(label="Ctrl+O — сохранить   ·   Ctrl+X — выйти и вернуться   ·   Ctrl+W — поиск",
+                             css_classes=["caption", "dimmed"], margin_top=6, margin_bottom=6)
+            term_box.append(hint)
+            term_box.append(self.terminal)
+            self.stack.add_named(term_box, "terminal")
+        else:
+            self.banner.set_title("nano откроется в отдельном терминале · встроить: sudo pacman -S vte4")
+            self.banner.set_button_label("Понятно")
+            self.banner.connect("button-clicked", self._dismiss_banner)
+            self.banner.set_revealed(not os.path.exists(BANNER_FLAG))
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.add_top_bar(self.banner)
+        view.set_content(self.stack)
+        return Adw.NavigationPage(title="Файл", child=view)
+
+    def _dismiss_banner(self, banner):
+        banner.set_revealed(False)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            open(BANNER_FLAG, "w").close()
+        except OSError:
+            pass
+
+    def _on_selected(self, *_):
+        if self.editing:
+            return
+        item = self.selection.get_selected_item()
+        self.current = item
+        self.show_file(item)
+
+    def show_file(self, cfg):
+        has = cfg is not None
+        for name in ("edit", "edit-sudo", "copy-path", "open-folder"):
+            self.lookup_action(name).set_enabled(has)
+        if not has:
+            self.content_title.set_title("Конфиги")
+            self.content_title.set_subtitle("")
+            self.stack.set_visible_child_name("none")
+            return
+        self.content_title.set_title(cfg.name)
+        self.content_title.set_subtitle(cfg.dir)
+        try:
+            st = os.stat(cfg.path)
+        except OSError:
+            st = None
+        cfg.writable = os.access(cfg.path, os.W_OK)
+        self._fill_meta(cfg, st)
+
+        if not os.access(cfg.path, os.R_OK):
+            self.stack.set_visible_child_name("locked")
+            return
+        try:
+            with open(cfg.path, "rb") as f:
+                raw = f.read(PREVIEW_LIMIT)
+        except OSError as e:
+            self.locked_page.set_description(str(e))
+            self.stack.set_visible_child_name("locked")
+            return
+        if b"\0" in raw[:4096]:
+            self.stack.set_visible_child_name("binary")
+            return
+        self._set_preview(raw.decode("utf-8", errors="replace"))
+        self.stack.set_visible_child_name("preview")
+
+    def _fill_meta(self, cfg, st):
+        while (child := self.meta.get_first_child()) is not None:
+            self.meta.remove(child)
+
+        def chip(text, cls=None):
+            lbl = Gtk.Label(label=text)
+            lbl.add_css_class("meta-chip")
+            if cls:
+                lbl.add_css_class(cls)
+            self.meta.append(lbl)
+
+        if cfg.writable:
+            chip("✎ можно редактировать")
+        else:
+            chip("🔒 нужен sudo", "root")
+        if st:
+            chip(owner_of(st))
+            chip(stat.filemode(st.st_mode))
+            chip(human_size(st.st_size))
+            chip("изменён " + time.strftime("%d.%m.%Y %H:%M", time.localtime(st.st_mtime)))
+
+    COMMENT_RE = re.compile(r"^\s*(#|//|--|;|!|\")")
+    SECTION_RE = re.compile(r"^\s*\[[^\]]+\]\s*$")
+    KEY_RE = re.compile(r"^(\s*)([A-Za-z_][\w.\-@$]*|\"[^\"]+\")(\s*)(=|:)")
+    STRING_RE = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'")
+
+    def _set_preview(self, text):
+        buf = self.buffer
+        buf.set_text(text)
+        if len(text) > 200_000:
+            return
+        for lineno, line in enumerate(text.split("\n")):
+            if not line.strip():
+                continue
+            if self.COMMENT_RE.match(line):
+                self._tag("comment", lineno, 0, len(line))
+                continue
+            if self.SECTION_RE.match(line):
+                self._tag("section", lineno, 0, len(line))
+                continue
+            m = self.KEY_RE.match(line)
+            if m:
+                self._tag("key", lineno, m.start(2), m.end(2))
+            for s in self.STRING_RE.finditer(line):
+                self._tag("string", lineno, s.start(), s.end())
+
+    def _tag(self, name, line, start, end):
+        a = self.buffer.get_iter_at_line_offset(line, start)[1]
+        b = self.buffer.get_iter_at_line_offset(line, end)[1]
+        self.buffer.apply_tag_by_name(name, a, b)
+
+    def _on_active_changed(self, *_):
+        if self.is_active() and not self.editing and self.current:
+            self.show_file(self.current)
+
+    # ── редактирование ──
+    def open_current(self, sudo=False):
+        cfg = self.current
+        if cfg is None or self.editing:
+            return
+        need_sudo = sudo or not os.access(cfg.path, os.W_OK)
+        argv = ["sudo", "nano", "--", cfg.path] if need_sudo else ["nano", "--", cfg.path]
+        self._remember(cfg.path)
+
+        if self.terminal is not None:
+            self.editing = True
+            self.listview.set_sensitive(False)
+            self.search.set_sensitive(False)
+            self.terminal.reset(True, True)
+            self.stack.set_visible_child_name("terminal")
+            self.split.set_show_content(True)
+            self.terminal.spawn_async(Vte.PtyFlags.DEFAULT, os.path.dirname(cfg.path), argv, None,
+                                      GLib.SpawnFlags.SEARCH_PATH, None, None, -1, None,
+                                      self._on_spawned, None)
+            self.terminal.grab_focus()
+        else:
+            self._spawn_external(argv)
+
+    def _on_spawned(self, _term, _pid, error, *_):
+        if error is not None:
+            self.toast(f"Не удалось запустить nano: {error.message}")
+            self._on_editor_exited()
+
+    def _on_editor_exited(self, *_):
+        self.editing = False
+        self.listview.set_sensitive(True)
+        self.search.set_sensitive(True)
+        self.show_file(self.current)
+        self.listview.grab_focus()
+
+    def _spawn_external(self, argv):
+        for launcher in (["xdg-terminal-exec"], ["alacritty", "-e"], ["foot"], ["kitty"], ["xterm", "-e"]):
+            if shutil.which(launcher[0]):
+                try:
+                    proc = Gio.Subprocess.new(launcher + argv, Gio.SubprocessFlags.NONE)
+                except GLib.Error as e:
+                    self.toast(f"Ошибка запуска терминала: {e.message}")
+                    return
+                proc.wait_async(None, lambda *_: self.current and self.show_file(self.current))
+                return
+        self.toast("Не найден эмулятор терминала")
+
+    def _remember(self, path):
+        self.recent = [path] + [p for p in self.recent if p != path]
+        self.recent = self.recent[:RECENT_MAX]
+        self.recent_rank = {p: i for i, p in enumerate(self.recent)}
+        save_recent(self.recent)
+
+    # ── действия ──
+    def _install_actions(self):
+        def add(name, cb, accels=()):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_: cb())
+            self.add_action(act)
+            if accels:
+                self.get_application().set_accels_for_action(f"win.{name}", list(accels))
+
+        add("edit", lambda: self.open_current(), ["<Ctrl>e"])
+        add("edit-sudo", lambda: self.open_current(sudo=True), ["<Ctrl><Shift>e"])
+        add("copy-path", self.copy_path, ["<Ctrl><Shift>c"])
+        add("open-folder", self.open_folder)
+        add("rescan", self.rescan, ["<Ctrl>r"])
+        add("focus-search", self.focus_search, ["<Ctrl>f", "<Ctrl>k"])
+        add("shortcuts", self.show_shortcuts, ["<Ctrl>question"])
+        add("scope-all", lambda: self.scope_group.set_active_name("all"), ["<Alt>1"])
+        add("scope-user", lambda: self.scope_group.set_active_name("user"), ["<Alt>2"])
+        add("scope-system", lambda: self.scope_group.set_active_name("system"), ["<Alt>3"])
+        add("scope-recent", lambda: self.scope_group.set_active_name("recent"), ["<Alt>4"])
+
+    def focus_search(self):
+        if not self.editing:
+            self.split.set_show_content(False)
+            self.search.grab_focus()
+            self.search.select_region(0, -1)
+
+    def copy_path(self):
+        if self.current:
+            self.get_display().get_clipboard().set(self.current.path)
+            self.toast("Путь скопирован")
+
+    def open_folder(self):
+        if self.current:
+            uri = Gio.File.new_for_path(os.path.dirname(self.current.path)).get_uri()
+            Gio.AppInfo.launch_default_for_uri_async(uri, None, None, None, None)
+
+    def show_shortcuts(self):
+        rows = [
+            ("Печатай где угодно", "поиск"), ("↑ ↓  PgUp PgDn", "выбор в списке"),
+            ("Enter / Ctrl+E", "открыть в nano"), ("Ctrl+Shift+E", "открыть через sudo nano"),
+            ("Ctrl+F", "к поиску"), ("Alt+1…4", "Все / Мои / /etc / Недавние"),
+            ("Ctrl+Shift+C", "скопировать путь"), ("Ctrl+R", "пересканировать"),
+        ]
+        group = Adw.PreferencesGroup()
+        for keys, what in rows:
+            row = Adw.ActionRow(title=what)
+            row.add_suffix(Gtk.Label(label=keys, css_classes=["dimmed", "monospace"]))
+            group.add(row)
+        page = Adw.PreferencesPage()
+        page.add(group)
+        dialog = Adw.Dialog(title="Горячие клавиши", content_width=440, content_height=520)
+        tv = Adw.ToolbarView(content=page)
+        tv.add_top_bar(Adw.HeaderBar())
+        dialog.set_child(tv)
+        dialog.present(self)
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=2))
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.initial_query = ""
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        quit_act = Gio.SimpleAction.new("quit", None)
+        quit_act.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_act)
+        self.set_accels_for_action("app.quit", ["<Ctrl>q"])
+
+    def do_command_line(self, cmdline):
+        query = " ".join(cmdline.get_arguments()[1:])
+        win = self.get_active_window() or Window(self)
+        if query:
+            win.search.set_text(query)
+            win.search.set_position(-1)
+        win.present()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# cfg — найти любой конфиг и сразу открыть его в nano (или sudo nano, если нет прав).
+#
+#   cfg              интерактивный поиск по всем конфигам
+#   cfg hypr         то же, но сразу с запросом "hypr"
+#   cfg -u | -e      только пользовательские (~) / только системные (/etc)
+#   cfg -l [запрос]  просто вывести список путей (без интерфейса)
+#
+# Клавиши в списке:
+#   Enter   открыть: nano, если файл можно писать, иначе sudo nano
+#   Ctrl-S  принудительно sudo nano
+#   Alt-U / Alt-E / Alt-A   показать ~ / /etc / всё
+#   Ctrl-R  пересканировать
+#   Ctrl-Y  скопировать путь в буфер
+#   Esc     выход
+
+set -o pipefail
+SELF=$(realpath "$0")
+
+# Расширения, которые считаем конфигами (+ файлы вообще без расширения)
+EXTS='conf|cfg|config|ini|toml|ya?ml|jsonc?|json5|lua|kdl|rc|sh|bash|zsh|fish|css|scss|qss|theme|desktop|service|timer|socket|target|path|mount|network|netdev|link|rules|xml|env|properties|list|nanorc|vim|preset|hook|repo|policy|tmpl'
+NAME_RE=".*/(\.?[^./]+|[^/]*\.($EXTS))"
+
+# Каталоги-мусор (кэши Electron/браузеров и т.п.)
+JUNK_DIRS=(
+  discord chromium Code Cursor cursor mozilla BraveSoftware google-chrome obsidian
+  Vencord vesktop fluxer browsh libreoffice spotify Slack "Dota 2 Mod Manager"
+  "*cache*" "Shared Dictionary" Partitions SharedStorage dbus lazy
+  blob_storage IndexedDB "Local Storage" "Session Storage" "Service Worker"
+  Crashpad logs node_modules .git __pycache__ ssl certs ca-certificates gnupg
+)
+
+# Аргументы find: "-type d (имя из JUNK_DIRS) -prune -o"
+junk_prune() {
+  local d; PRUNE=(-type d \()
+  for d in "${JUNK_DIRS[@]}"; do PRUNE+=(-iname "$d" -o); done
+  PRUNE+=(-false \) -prune -o)
+}
+
+scan_user() {
+  junk_prune
+  # dotfiles прямо в ~
+  find "$HOME" -mindepth 1 -maxdepth 1 -type f -name '.*' \
+    ! -name '*history*' ! -name '*.bak*' ! -name '*backup*' ! -name '*pid' \
+    ! -name '*cookie*' ! -name '*.lock' ! -name '.steampath' -size -512k \
+    \( -writable -printf 'W\t%p\n' -o -printf 'R\t%p\n' \) 2>/dev/null
+  # ~/.config целиком + несколько известных мест
+  find "$HOME/.config" "$HOME/.local/share/applications" "$HOME/.ssh/config" \
+    "${PRUNE[@]}" \
+    \( -type f -size -512k -regextype posix-extended -regex "$NAME_RE" ! -name '*-journal' \
+       \( -writable -printf 'W\t%p\n' -o -printf 'R\t%p\n' \) \) 2>/dev/null
+}
+
+scan_system() {
+  junk_prune
+  # -readable не требуем: закрытые на чтение файлы тоже показываем (откроются через sudo)
+  find /etc "${PRUNE[@]}" \
+    \( -type f -size -512k -regextype posix-extended -regex "$NAME_RE" ! -name '*-journal' \
+       \( -writable -printf 'W\t%p\n' -o -printf 'R\t%p\n' \) \) 2>/dev/null
+}
+
+# Формат строки: <путь>\t<W|R>\t<красивое отображение>
+list() {
+  case "${1:-all}" in
+    user)   scan_user ;;
+    system) scan_system ;;
+    *)      scan_user; scan_system ;;
+  esac | awk -F'\t' -v home="$HOME" '
+    {
+      shown = $2
+      if (index(shown, home "/") == 1) shown = "~" substr(shown, length(home) + 1)
+      tag = ($1 == "W") ? "        " : "\033[31m[sudo]\033[0m  "
+      printf "%s\t%s\t%s%s\n", $2, $1, tag, shown
+    }' | sort -t$'\t' -k3,3 -u
+}
+
+open_file() {
+  local f=$1 mode=${2:-auto}
+  if [[ $mode == sudo ]] || { [[ -e $f ]] && [[ ! -w $f ]]; }; then
+    sudo nano -- "$f"
+  else
+    nano -- "$f"
+  fi
+}
+
+preview() {
+  local f=$1
+  printf '\033[1m%s\033[0m\n' "$f"
+  ls -l --time-style=+'%Y-%m-%d %H:%M' -- "$f" 2>/dev/null | awk '{print $1, $3":"$4, $6, $7}'
+  echo
+  if [[ -r $f ]]; then
+    if command -v bat >/dev/null; then
+      bat --color=always --style=numbers --paging=never --line-range=:400 -- "$f"
+    else
+      head -n 400 -- "$f"
+    fi
+  else
+    printf '\033[31m🔒 Нет прав на чтение.\033[0m Enter откроет через sudo nano.\n'
+  fi
+}
+
+case $1 in
+  --list)    list "$2"; exit ;;
+  --open)    open_file "$2" "$3"; exit ;;
+  --preview) preview "$2"; exit ;;
+  -l)        shift; list all | cut -f1 | grep -i -- "${*:-}"; exit ;;
+  -h|--help) sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; exit ;;
+esac
+
+scope=all
+case $1 in
+  -u) scope=user; shift ;;
+  -e) scope=system; shift ;;
+esac
+
+command -v fzf >/dev/null || { echo "Нужен fzf: sudo pacman -S fzf" >&2; exit 1; }
+
+clip='wl-copy'; command -v wl-copy >/dev/null || clip='xclip -selection clipboard'
+
+list "$scope" | fzf \
+  --ansi --delimiter='\t' --with-nth=3 \
+  --query="$*" --prompt='конфиг> ' \
+  --header=$'Enter открыть · Ctrl-S sudo nano · Ctrl-Y копировать путь\nAlt-U ~ · Alt-E /etc · Alt-A всё · Ctrl-R обновить' \
+  --header-first --layout=reverse --height=100% --border=rounded \
+  --border-label=' cfg — редактор конфигов ' \
+  --preview="'$SELF' --preview {1}" --preview-window='right,55%,border-left' \
+  --bind="enter:execute('$SELF' --open {1})" \
+  --bind="ctrl-s:execute('$SELF' --open {1} sudo)" \
+  --bind="alt-u:reload('$SELF' --list user)+change-prompt(~ конфиг> )" \
+  --bind="alt-e:reload('$SELF' --list system)+change-prompt(/etc конфиг> )" \
+  --bind="alt-a:reload('$SELF' --list all)+change-prompt(конфиг> )" \
+  --bind="ctrl-r:reload('$SELF' --list $scope)" \
+  --bind="ctrl-y:execute-silent(printf %s {1} | $clip)+bell"
